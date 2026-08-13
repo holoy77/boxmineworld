@@ -66,15 +66,15 @@ class AFKWorker:
                     logger.warning("⚠️ 检测到账号已在其他设备（如网页端）挂机中！请先关闭网页端挂机。")
                     return
 
-                # 2. 响应服务端的活跃度检查 (activity_check)
+# 2. 响应服务端的活跃度检查 (activity_check)
                 if msg_type == "activity_check":
                     check_id = msg.get("checkId")
                     logger.info(f"📩 收到服务端心跳校验 checkId: {check_id}")
                     
-                    # 按照截图抓包格式应答
+                    # ⚠️ 注意：这里 checkId 的 I 必须大写！
                     response_payload = {
                         "type": "activity_check_response",
-                        "checkid": check_id,
+                        "checkId": check_id,
                         "subscriptionId": self.subscription_id
                     }
                     ws.send(json.dumps(response_payload))
