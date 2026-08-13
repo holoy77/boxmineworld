@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import threading
 import logging
 from datetime import datetime, timezone
 import websocket
@@ -22,7 +23,6 @@ RUN_MINUTES = int(os.getenv("RUN_MINUTES", "340"))
 STATE_FILE = "boxmineworld_state.json"
 BASE_WS_URL = "wss://afkapi.boxmineworld.com/socket"
 
-# 请求头配置
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Origin": "https://afk.boxmineworld.com",
@@ -67,14 +67,45 @@ class AFKWorker:
         self.state = state
         self.max_seconds = run_minutes * 60
         self.start_time = time.time()
+        self.stop_heartbeat = threading.Event()
+
+    def send_heartbeat_loop(self, ws):
+        """后台子线程：每 15 秒发送一次应用层心跳"""
+        logger.info("⏱️ 启动业务心跳定时器（每 15 秒发送一次）...")
+        
+        # 尝试几种常见的心跳载荷
+        payloads = [
+            json.dumps({"type": "ping"}),
+            json.dumps({"action": "ping"}),
+            json.dumps({"event": "ping"}),
+            "ping",
+            "2"  # Socket.IO 格式的 ping
+        ]
+        
+        index = 0
+        while not self.stop_heartbeat.is_set():
+            try:
+                # 轮询或者固定发送 ping 字符串
+                # BoxMineWorld 通常接受文本 "ping" 或 JSON
+                ping_str = "ping"
+                ws.send(ping_str)
+                logger.debug(f"📤 已发送心跳包: {ping_str}")
+            except Exception as e:
+                logger.warning(f"发送心跳失败: {e}")
+                break
+            
+            # 每 15 秒发送一次，防止 80s 无响应被踢
+            time.sleep(15)
 
     def run_websocket(self):
         def on_message(ws, message):
             try:
                 msg = json.loads(message)
                 logger.info(f"📩 收到服务器消息: {msg}")
-                if "coins" in msg:
-                    self.state["coins_earned"] = msg.get("coins", self.state.get("coins_earned", 0))
+                if "coins" in msg or "balance" in msg:
+                    coins = msg.get("coins") or msg.get("balance") or 0
+                    self.state["coins_earned"] = coins
+                    logger.info(f"💰 当前金币数量: {coins}")
             except Exception:
                 logger.info(f"📩 收到原始消息: {message}")
 
@@ -82,25 +113,24 @@ class AFKWorker:
             logger.error(f"⚠️ WebSocket 错误: {error}")
 
         def on_close(ws, close_status_code, close_msg):
+            self.stop_heartbeat.set()
             logger.info(f"🔒 WebSocket 连接关闭: {close_status_code} - {close_msg}")
 
         def on_open(ws):
-            logger.info("🟢 WebSocket 连接成功，发送挂机心跳保活...")
-            # 部分服务器在 WebSocket 连接建立后需要发送初始化/订阅消息
-            # 如果只需要保持长连接，直接发 ping 即可
-            try:
-                ping_msg = json.dumps({"type": "ping", "session_key": SESSION_KEY})
-                ws.send(ping_msg)
-            except Exception as e:
-                logger.warning(f"发送初始 ping 失败: {e}")
+            logger.info("🟢 WebSocket 连接成功，开始保活...")
+            self.stop_heartbeat.clear()
+            
+            # 开启独立线程维持心跳
+            t = threading.Thread(target=self.send_heartbeat_loop, args=(ws,), daemon=True)
+            t.start()
 
         token_param = SESSION_KEY or DISCORD_TOKEN
-        ws_url = f"{BASE_WS_URL}?session_key={token_param}"
+        ws_url = f"{BASE_WS_URL}?session_key={token_param}&token={token_param}"
 
         while time.time() - self.start_time < self.max_seconds:
             elapsed = time.time() - self.start_time
             remaining_min = int((self.max_seconds - elapsed) / 60)
-            logger.info(f"⏱️ 尝试连接 AFK 服务器 | 剩余 {remaining_min} 分钟...")
+            logger.info(f"⌛ 尝试连接 AFK 服务器 | 剩余 {remaining_min} 分钟...")
 
             ws = websocket.WebSocketApp(
                 ws_url,
@@ -111,17 +141,16 @@ class AFKWorker:
                 on_close=on_close
             )
 
-            # 开启长连接，每 25 秒发送一次底层 Ping 控制帧
-            ws.run_forever(ping_interval=25, ping_timeout=10)
+            # 运行连接
+            ws.run_forever()
 
-            # 更新运行时间并保存状态
+            # 连接挂掉后，更新状态
             self.state["total_minutes"] += 1
             save_state(self.state)
 
-            # 连接断开后，等待 10 秒后自动重连
             if time.time() - self.start_time < self.max_seconds:
-                logger.info("🔄 10 秒后尝试重新连接 WebSocket...")
-                time.sleep(10)
+                logger.info("🔄 连接中断，5 秒后尝试重新连接...")
+                time.sleep(5)
 
     def start(self):
         logger.info(f"🚀 开始运行 AFK 挂机脚本，设定运行时长: {RUN_MINUTES} 分钟")
