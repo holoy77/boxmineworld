@@ -2,7 +2,7 @@ import os
 import sys
 import time
 import json
-import threading
+import uuid
 import logging
 from datetime import datetime, timezone
 import websocket
@@ -29,35 +29,21 @@ HEADERS = {
     "Referer": "https://afk.boxmineworld.com/",
 }
 
-if SESSION_KEY:
-    HEADERS["Authorization"] = f"Bearer {SESSION_KEY}"
-elif DISCORD_TOKEN:
-    HEADERS["Authorization"] = f"Bearer {DISCORD_TOKEN}"
-
 # ==================== 状态管理 ====================
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                state = json.load(f)
-                logger.info(f"已加载本地状态: {state}")
-                return state
-        except Exception as e:
-            logger.warning(f"读取状态文件失败，将使用默认状态: {e}")
-    
-    return {
-        "last_run": None,
-        "daily_count": 0,
-        "total_minutes": 0,
-        "coins_earned": 0
-    }
+                return json.load(f)
+        except Exception:
+            pass
+    return {"last_run": None, "daily_count": 0, "total_minutes": 0, "coins_earned": 0}
 
 def save_state(state: dict):
     try:
         state["last_run"] = datetime.now(timezone.utc).isoformat()
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
-        logger.info(f"已更新状态文件 {STATE_FILE}")
     except Exception as e:
         logger.error(f"保存状态文件失败: {e}")
 
@@ -67,70 +53,68 @@ class AFKWorker:
         self.state = state
         self.max_seconds = run_minutes * 60
         self.start_time = time.time()
-        self.stop_heartbeat = threading.Event()
-
-    def send_heartbeat_loop(self, ws):
-        """后台子线程：每 15 秒发送一次应用层心跳"""
-        logger.info("⏱️ 启动业务心跳定时器（每 15 秒发送一次）...")
-        
-        # 尝试几种常见的心跳载荷
-        payloads = [
-            json.dumps({"type": "ping"}),
-            json.dumps({"action": "ping"}),
-            json.dumps({"event": "ping"}),
-            "ping",
-            "2"  # Socket.IO 格式的 ping
-        ]
-        
-        index = 0
-        while not self.stop_heartbeat.is_set():
-            try:
-                # 轮询或者固定发送 ping 字符串
-                # BoxMineWorld 通常接受文本 "ping" 或 JSON
-                ping_str = "ping"
-                ws.send(ping_str)
-                logger.debug(f"📤 已发送心跳包: {ping_str}")
-            except Exception as e:
-                logger.warning(f"发送心跳失败: {e}")
-                break
-            
-            # 每 15 秒发送一次，防止 80s 无响应被踢
-            time.sleep(15)
+        self.subscription_id = str(uuid.uuid4())
 
     def run_websocket(self):
         def on_message(ws, message):
             try:
                 msg = json.loads(message)
-                logger.info(f"📩 收到服务器消息: {msg}")
-                if "coins" in msg or "balance" in msg:
-                    coins = msg.get("coins") or msg.get("balance") or 0
+                msg_type = msg.get("type")
+
+                # 1. 处理多设备冲突警告
+                if msg.get("error") == "{device:true}":
+                    logger.warning("⚠️ 检测到账号已在其他设备（如网页端）挂机中！请先关闭网页端挂机。")
+                    return
+
+                # 2. 响应服务端的活跃度检查 (activity_check)
+                if msg_type == "activity_check":
+                    check_id = msg.get("checkId")
+                    logger.info(f"📩 收到服务端心跳校验 checkId: {check_id}")
+                    
+                    # 按照截图抓包格式应答
+                    response_payload = {
+                        "type": "activity_check_response",
+                        "checkid": check_id,
+                        "subscriptionId": self.subscription_id
+                    }
+                    ws.send(json.dumps(response_payload))
+                    logger.info(f"📤 已成功应答心跳校验！")
+
+                # 3. 统计金币/收益变动
+                if "coins" in msg or "balance" in msg or "earned" in msg:
+                    coins = msg.get("coins") or msg.get("balance") or msg.get("earned") or 0
                     self.state["coins_earned"] = coins
-                    logger.info(f"💰 当前金币数量: {coins}")
+                    logger.info(f"💰 当前收益金币: {coins}")
+
             except Exception:
-                logger.info(f"📩 收到原始消息: {message}")
+                logger.info(f"📩 收到消息: {message}")
 
         def on_error(ws, error):
             logger.error(f"⚠️ WebSocket 错误: {error}")
 
         def on_close(ws, close_status_code, close_msg):
-            self.stop_heartbeat.set()
             logger.info(f"🔒 WebSocket 连接关闭: {close_status_code} - {close_msg}")
 
         def on_open(ws):
-            logger.info("🟢 WebSocket 连接成功，开始保活...")
-            self.stop_heartbeat.clear()
+            logger.info("🟢 WebSocket 已连接，发送挂机订阅请求...")
             
-            # 开启独立线程维持心跳
-            t = threading.Thread(target=self.send_heartbeat_loop, args=(ws,), daemon=True)
-            t.start()
+            # 生成全新的订阅 ID 并发送 subscribe 报文
+            self.subscription_id = str(uuid.uuid4())
+            subscribe_payload = {
+                "type": "subscribe",
+                "path": "/earn",
+                "subscriptionId": self.subscription_id
+            }
+            ws.send(json.dumps(subscribe_payload))
+            logger.info(f"📤 已发送订阅: {subscribe_payload}")
 
         token_param = SESSION_KEY or DISCORD_TOKEN
-        ws_url = f"{BASE_WS_URL}?session_key={token_param}&token={token_param}"
+        ws_url = f"{BASE_WS_URL}?token={token_param}&session_key={token_param}"
 
         while time.time() - self.start_time < self.max_seconds:
             elapsed = time.time() - self.start_time
             remaining_min = int((self.max_seconds - elapsed) / 60)
-            logger.info(f"⌛ 尝试连接 AFK 服务器 | 剩余 {remaining_min} 分钟...")
+            logger.info(f"⌛ 连接挂机服务器中... | 剩余 {remaining_min} 分钟")
 
             ws = websocket.WebSocketApp(
                 ws_url,
@@ -141,20 +125,19 @@ class AFKWorker:
                 on_close=on_close
             )
 
-            # 运行连接
+            # 保持连接
             ws.run_forever()
 
-            # 连接挂掉后，更新状态
+            # 断线保存并准备重连
             self.state["total_minutes"] += 1
             save_state(self.state)
 
             if time.time() - self.start_time < self.max_seconds:
-                logger.info("🔄 连接中断，5 秒后尝试重新连接...")
-                time.sleep(5)
+                logger.info("🔄 10 秒后重新连接...")
+                time.sleep(10)
 
     def start(self):
-        logger.info(f"🚀 开始运行 AFK 挂机脚本，设定运行时长: {RUN_MINUTES} 分钟")
-        
+        logger.info(f"🚀 开始运行 AFK 挂机脚本，设定时长: {RUN_MINUTES} 分钟")
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self.state.get("last_date") != today_str:
             self.state["last_date"] = today_str
@@ -163,17 +146,14 @@ class AFKWorker:
         try:
             self.run_websocket()
         except KeyboardInterrupt:
-            logger.info("🛑 收到中断信号，准备退出...")
+            pass
         finally:
             save_state(self.state)
-            logger.info("✅ 本轮挂机任务完成。")
 
-# ==================== 入口函数 ====================
 if __name__ == "__main__":
     if not DISCORD_TOKEN and not SESSION_KEY:
-        logger.error("❌ 错误: 未配置 BOXMINEWORLD_DISCORD_TOKEN 或 BOXMINEWORLD_SESSION_KEY 环境变量！")
+        logger.error("❌ 未配置 BOXMINEWORLD_SESSION_KEY！")
         sys.exit(1)
-
     state = load_state()
     worker = AFKWorker(state=state, run_minutes=RUN_MINUTES)
     worker.start()
