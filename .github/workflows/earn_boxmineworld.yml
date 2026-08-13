@@ -23,10 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
-      - name: Checkout clean boxmineworld branch
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: boxmineworld
           fetch-depth: 0
 
       - name: Setup Python
@@ -56,4 +55,4 @@ jobs:
             exit 0
           fi
           git commit -m "Update BoxMineWorld AFK state [skip ci]"
-          git push origin HEAD:boxmineworld
+          git push origin HEAD
