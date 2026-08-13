@@ -1,0 +1,59 @@
+name: BoxMineWorld AFK Earn
+
+on:
+  # 每 6 小时检查一次；达到每日 8 个后立即结束，等待额度重置。
+  schedule:
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: "本轮运行分钟数"
+        required: false
+        default: "340"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: boxmineworld-afk-earn
+  cancel-in-progress: false
+
+jobs:
+  earn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout clean boxmineworld branch
+        uses: actions/checkout@v4
+        with:
+          ref: boxmineworld
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install --upgrade requests websocket-client cryptography
+
+      - name: Run BoxMineWorld AFK earn
+        env:
+          BOXMINEWORLD_DISCORD_TOKEN: ${{ secrets.BOXMINEWORLD_DISCORD_TOKEN }}
+          BOXMINEWORLD_SESSION_KEY: ${{ secrets.BOXMINEWORLD_SESSION_KEY }}
+          RUN_MINUTES: ${{ github.event.inputs.run_minutes || '340' }}
+          NO_PROXY: "afkapi.boxmineworld.com,discord.com"
+        run: python earn_boxmineworld.py
+
+      - name: Save BoxMineWorld state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add boxmineworld_state.json || true
+          if git diff --cached --quiet; then
+            echo "No BoxMineWorld state change."
+            exit 0
+          fi
+          git commit -m "Update BoxMineWorld AFK state [skip ci]"
+          git push origin HEAD:boxmineworld
