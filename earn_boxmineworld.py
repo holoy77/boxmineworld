@@ -20,7 +20,6 @@ RUN_MINUTES = int(os.getenv("RUN_MINUTES", "340"))
 STATE_FILE = "boxmineworld_state.json"
 TARGET_URL = "https://afk.boxmineworld.com"
 
-# 清理 Session Key（兼容包含键名或前后引号的情况）
 if "_SECURE_BOX_AUTH_SESSION_=" in SESSION_KEY:
     SESSION_KEY = SESSION_KEY.split("_SECURE_BOX_AUTH_SESSION_=")[-1].split(";")[0].strip()
 
@@ -63,7 +62,6 @@ def run_browser_afk():
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
                 "--mute-audio"
             ]
         )
@@ -89,11 +87,9 @@ def run_browser_afk():
             try:
                 msg = json.loads(frame.payload)
                 
-                # 错误处理：仅在失败/异常时输出
                 if msg.get("error") == "{device:true}":
                     logger.error("❌ 心跳异常: 账号正在其他设备挂机中，连接冲突！")
                 
-                # 金币数据监听（捕获 /earn 路径下的数据推送）
                 data = msg.get("data", {})
                 if isinstance(data, dict):
                     earned = data.get("earned")
@@ -107,7 +103,6 @@ def run_browser_afk():
                             save_state(state)
                             logger.info(f"💰 【金币增加】当前累计获得: {earned} / {max_earn} 个金币")
 
-                        # 达到额度或进入冷却自动退出
                         if cooldown or earned >= max_earn:
                             logger.info(f"🏁 已达到每日挂机上限或进入冷却 (已得: {earned} 个)，任务完成，结束运行。")
                             state["status"] = "completed"
@@ -119,24 +114,24 @@ def run_browser_afk():
                 pass
 
         def on_web_socket(ws):
-            # 仅在 WS 异常关闭时报警
+            logger.info("🟢 浏览器已成功建立 WebSocket 挂机连接！")
             ws.on("framereceived", handle_ws_frame)
             ws.on("close", lambda: logger.warning("⚠️ WebSocket 心跳连接断开，页面将自动重连..."))
             ws.on("socketerror", lambda err: logger.error(f"❌ WebSocket 连接失败: {err}"))
 
         page.on("websocket", on_web_socket)
 
-        # 访问挂机页面
+        # 优化点：改为 domcontentloaded，不再死等动态广告
         try:
             logger.info("🌐 正在载入 afk.boxmineworld.com ...")
-            page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
+            page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+            logger.info("✅ 页面加载成功，已进入后台挂机监控状态...")
         except Exception as e:
-            logger.error(f"❌ 页面加载超时或失败: {e}")
+            logger.error(f"❌ 页面加载异常: {e}")
 
         # 挂机轮询循环
         while time.time() - start_time < max_seconds:
             time.sleep(30)
-            # 保持状态更新
             save_state(state)
 
         logger.info("⏱️ 本轮挂机设定时间已满，正常结束。")
