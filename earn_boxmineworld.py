@@ -2,10 +2,9 @@ import os
 import sys
 import time
 import json
-import uuid
 import logging
 from datetime import datetime, timezone
-import websocket
+from playwright.sync_api import sync_playwright
 
 # ==================== 日志配置 ====================
 logging.basicConfig(
@@ -15,29 +14,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BoxMineWorld-AFK")
 
-# ==================== 配置与环境变量 ====================
-DISCORD_TOKEN = os.getenv("BOXMINEWORLD_DISCORD_TOKEN", "")
-SESSION_KEY = os.getenv("BOXMINEWORLD_SESSION_KEY", "")
+# ==================== 环境变量与配置 ====================
+SESSION_KEY = os.getenv("BOXMINEWORLD_SESSION_KEY", "").strip()
 RUN_MINUTES = int(os.getenv("RUN_MINUTES", "340"))
-
 STATE_FILE = "boxmineworld_state.json"
-BASE_WS_URL = "wss://afkapi.boxmineworld.com/socket"
+TARGET_URL = "https://afk.boxmineworld.com"
 
-# 组装请求头：将 SESSION_KEY 正确拼装入 Cookie 中
-headers_list = [
-    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Origin: https://afk.boxmineworld.com",
-    "Referer: https://afk.boxmineworld.com/"
-]
-
-if SESSION_KEY:
-    # 判断如果环境变量里只是纯 Token，就自动补全 Cookie 键名；如果是完整 Cookie 则直接使用
-    if "_SECURE_BOX_AUTH_SESSION_" in SESSION_KEY:
-        headers_list.append(f"Cookie: {SESSION_KEY}")
-    else:
-        headers_list.append(f"Cookie: _SECURE_BOX_AUTH_SESSION_={SESSION_KEY}")
-elif DISCORD_TOKEN:
-    headers_list.append(f"Authorization: Bearer {DISCORD_TOKEN}")
+# 清理 Session Key（兼容包含键名或前后引号的情况）
+if "_SECURE_BOX_AUTH_SESSION_=" in SESSION_KEY:
+    SESSION_KEY = SESSION_KEY.split("_SECURE_BOX_AUTH_SESSION_=")[-1].split(";")[0].strip()
 
 # ==================== 状态管理 ====================
 def load_state() -> dict:
@@ -47,7 +32,7 @@ def load_state() -> dict:
                 return json.load(f)
         except Exception:
             pass
-    return {"last_run": None, "daily_count": 0, "total_minutes": 0, "coins_earned": 0}
+    return {"last_run": None, "daily_count": 0, "coins_earned": 0, "status": "init"}
 
 def save_state(state: dict):
     try:
@@ -57,113 +42,105 @@ def save_state(state: dict):
     except Exception as e:
         logger.error(f"保存状态文件失败: {e}")
 
-# ==================== AFK 核心逻辑 ====================
-class AFKWorker:
-    def __init__(self, state: dict, run_minutes: int):
-        self.state = state
-        self.max_seconds = run_minutes * 60
-        self.start_time = time.time()
-        self.subscription_id = str(uuid.uuid4())
+# ==================== 主挂机逻辑 ====================
+def run_browser_afk():
+    if not SESSION_KEY:
+        logger.error("❌ 缺少 BOXMINEWORLD_SESSION_KEY 环境变量！")
+        sys.exit(1)
 
-    def run_websocket(self):
-        def on_message(ws, message):
+    state = load_state()
+    start_time = time.time()
+    max_seconds = RUN_MINUTES * 60
+    current_coins = state.get("coins_earned", 0)
+
+    logger.info(f"🚀 启动 Playwright 无头浏览器挂机模式 | 预设最长运行: {RUN_MINUTES} 分钟")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--mute-audio"
+            ]
+        )
+
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800}
+        )
+
+        # 注入登录 Cookie
+        context.add_cookies([{
+            "name": "_SECURE_BOX_AUTH_SESSION_",
+            "value": SESSION_KEY,
+            "domain": ".boxmineworld.com",
+            "path": "/"
+        }])
+
+        page = context.new_page()
+
+        # 监听 WebSocket 消息（仅处理错误与金币结算）
+        def handle_ws_frame(frame):
+            nonlocal current_coins
             try:
-                msg = json.loads(message)
-                msg_type = msg.get("type")
-
-                # 多设备挂机排他检测
+                msg = json.loads(frame.payload)
+                
+                # 错误处理：仅在失败/异常时输出
                 if msg.get("error") == "{device:true}":
-                    logger.warning("⚠️ 警告：账号已在其他设备（如浏览器）挂机！请关闭网页挂机。")
-                    return
+                    logger.error("❌ 心跳异常: 账号正在其他设备挂机中，连接冲突！")
+                
+                # 金币数据监听（捕获 /earn 路径下的数据推送）
+                data = msg.get("data", {})
+                if isinstance(data, dict):
+                    earned = data.get("earned")
+                    max_earn = data.get("max_earn", 8)
+                    cooldown = data.get("cooldown", False)
 
-                # 响应心跳校验
-                if msg_type == "activity_check":
-                    check_id = msg.get("checkId")
-                    logger.info(f"📩 收到心跳校验 checkId: {check_id}")
-                    
-                    response_payload = {
-                        "type": "activity_check_response",
-                        "checkId": check_id,
-                        "subscriptionId": self.subscription_id
-                    }
-                    ws.send(json.dumps(response_payload))
-                    logger.info(f"📤 已成功应答心跳！")
+                    if earned is not None:
+                        if earned != current_coins:
+                            current_coins = earned
+                            state["coins_earned"] = earned
+                            save_state(state)
+                            logger.info(f"💰 【金币增加】当前累计获得: {earned} / {max_earn} 个金币")
 
-                # 监听所有的金币与状态消息（抓取任何可能包含收益的字段）
-                for key in ["coins", "balance", "earned", "session_coins", "amount"]:
-                    if key in msg:
-                        coins = msg[key]
-                        self.state["coins_earned"] = coins
-                        logger.info(f"🎉 成功获取金币变化通知！当前收益: {coins}")
-                        break
-                else:
-                    if msg_type not in ["activity_check"]:
-                        logger.info(f"📩 收到服务端下发数据: {msg}")
+                        # 达到额度或进入冷却自动退出
+                        if cooldown or earned >= max_earn:
+                            logger.info(f"🏁 已达到每日挂机上限或进入冷却 (已得: {earned} 个)，任务完成，结束运行。")
+                            state["status"] = "completed"
+                            save_state(state)
+                            browser.close()
+                            sys.exit(0)
 
             except Exception:
-                logger.info(f"📩 收到原始消息: {message}")
+                pass
 
-        def on_error(ws, error):
-            logger.error(f"⚠️ WebSocket 错误: {error}")
+        def on_web_socket(ws):
+            # 仅在 WS 异常关闭时报警
+            ws.on("framereceived", handle_ws_frame)
+            ws.on("close", lambda: logger.warning("⚠️ WebSocket 心跳连接断开，页面将自动重连..."))
+            ws.on("socketerror", lambda err: logger.error(f"❌ WebSocket 连接失败: {err}"))
 
-        def on_close(ws, close_status_code, close_msg):
-            logger.info(f"🔒 WebSocket 连接关闭: {close_status_code} - {close_msg}")
+        page.on("websocket", on_web_socket)
 
-        def on_open(ws):
-            logger.info("🟢 已成功带凭证连接至 WebSocket！发送挂机订阅...")
-            
-            self.subscription_id = str(uuid.uuid4())
-            subscribe_payload = {
-                "type": "subscribe",
-                "path": "/earn",
-                "subscriptionId": self.subscription_id
-            }
-            ws.send(json.dumps(subscribe_payload))
-            logger.info(f"📤 已发送挂机订阅包")
-
-        ws_url = BASE_WS_URL
-
-        while time.time() - self.start_time < self.max_seconds:
-            elapsed = time.time() - self.start_time
-            remaining_min = int((self.max_seconds - elapsed) / 60)
-            logger.info(f"⌛ 运行挂机任务中... | 本轮剩余 {remaining_min} 分钟")
-
-            ws = websocket.WebSocketApp(
-                ws_url,
-                header=headers_list,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
-
-            ws.run_forever()
-
-            self.state["total_minutes"] += 1
-            save_state(self.state)
-
-            if time.time() - self.start_time < self.max_seconds:
-                logger.info("🔄 10 秒后重新连接...")
-                time.sleep(10)
-
-    def start(self):
-        logger.info(f"🚀 开始运行 AFK 挂机脚本，设定时长: {RUN_MINUTES} 分钟")
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if self.state.get("last_date") != today_str:
-            self.state["last_date"] = today_str
-            self.state["daily_count"] = self.state.get("daily_count", 0) + 1
-
+        # 访问挂机页面
         try:
-            self.run_websocket()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            save_state(self.state)
+            logger.info("🌐 正在载入 afk.boxmineworld.com ...")
+            page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
+        except Exception as e:
+            logger.error(f"❌ 页面加载超时或失败: {e}")
+
+        # 挂机轮询循环
+        while time.time() - start_time < max_seconds:
+            time.sleep(30)
+            # 保持状态更新
+            save_state(state)
+
+        logger.info("⏱️ 本轮挂机设定时间已满，正常结束。")
+        browser.close()
 
 if __name__ == "__main__":
-    if not DISCORD_TOKEN and not SESSION_KEY:
-        logger.error("❌ 未配置 BOXMINEWORLD_SESSION_KEY！")
-        sys.exit(1)
-    state = load_state()
-    worker = AFKWorker(state=state, run_minutes=RUN_MINUTES)
-    worker.start()
+    run_browser_afk()
