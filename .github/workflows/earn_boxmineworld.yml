@@ -2,36 +2,56 @@ name: BoxMineWorld AFK Earn
 
 on:
   schedule:
-    # 每天 UTC 00:00（北京时间 08:00）运行一次
-    - cron: '0 1 * * *'
-  workflow_dispatch: # 保留手动触发按钮
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: "本轮运行分钟数"
+        required: false
+        default: "60"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: boxmineworld-afk-earn
+  cancel-in-progress: false
 
 jobs:
   earn:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
-          pip install playwright
-          playwright install chromium --with-deps
+          pip install --upgrade playwright
+          playwright install --with-deps chromium
 
       - name: Run BoxMineWorld AFK earn
-        run: |
-          python earn_boxmineworld.py
+        env:
+          BOXMINEWORLD_SESSION_KEY: ${{ secrets.BOXMINEWORLD_SESSION_KEY }}
+          RUN_MINUTES: ${{ github.event.inputs.run_minutes || '340' }}
+        run: python earn_boxmineworld.py
 
       - name: Save BoxMineWorld state
         if: always()
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add boxmineworld_state.json || true
-          git commit -m "chore: update session state [skip ci]" || true
-          git push || true
+          if git diff --cached --quiet; then
+            echo "No BoxMineWorld state change."
+            exit 0
+          fi
+          git commit -m "Update BoxMineWorld AFK state [skip ci]"
+          git push origin HEAD
