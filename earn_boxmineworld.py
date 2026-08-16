@@ -16,7 +16,7 @@ logger = logging.getLogger("BoxMineWorld-AFK")
 
 # ==================== 环境变量与配置 ====================
 SESSION_KEY = os.getenv("BOXMINEWORLD_SESSION_KEY", "").strip()
-RUN_MINUTES = int(os.getenv("RUN_MINUTES", "60"))
+RUN_MINUTES = int(os.getenv("RUN_MINUTES", "15"))
 STATE_FILE = "boxmineworld_state.json"
 TARGET_URL = "https://afk.boxmineworld.com"
 
